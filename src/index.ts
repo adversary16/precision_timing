@@ -1,17 +1,28 @@
+const IS_DEBUG =
+	process.env.NODE_ENV &&
+	['dev', 'develop', 'debug'].includes(process.env.NODE_ENV);
+
 const MSEC_IN_SEC = 1000;
 const NSEC_IN_MSEC = 1000 * 1000;
 const NSEC_IN_SEC = MSEC_IN_SEC * NSEC_IN_MSEC;
+const APP_BATCH_SIZE =
+	process.env.APP_BATCH_SIZE &&
+	!Number.isNaN(Number(process.env.APP_BATCH_SIZE))
+		? Number(process.env.APP_BATCH_SIZE)
+		: 32;
+
+type Task = () => Promise<void>;
+type TaskGroup = Array<Task>;
 
 class PrecisionTimer {
-	readonly #basePrecisionMsec = 1;
-	#interval?: NodeJS.Immediate;
-	#loopStart = process.hrtime.bigint();
-	#callsPerMsec = 1;
+	readonly #basePrecisionMsec = 100;
+	#interval?: NodeJS.Timeout;
 	#taskCounter = 0;
 	#prevTaskCounter = 0;
 	#loops = 0;
 
-    #startLoopTime = Date.now();
+	#startLoopTime = Date.now();
+	rps: number;
 	public timeAvg = 0;
 
 	/**
@@ -21,17 +32,7 @@ class PrecisionTimer {
 	constructor(rps: number) {
 		this.rps = rps;
 		console.log('rps: ', this.rps);
-	}
-
-	set rps(value: number) {
-		if (value <= 0)
-			throw new Error('Requests per second must be a positive number');
-		this.#callsPerMsec =
-			Math.round((value / MSEC_IN_SEC + Number.EPSILON) * 100) / 100;
-	}
-
-	get rps(): number {
-		return this.#callsPerMsec * MSEC_IN_SEC;
+		IS_DEBUG && console.log('Batch size is', APP_BATCH_SIZE);
 	}
 
 	public start() {
@@ -40,24 +41,40 @@ class PrecisionTimer {
 
 	public stop() {
 		this.#interval?.unref();
-		clearImmediate(this.#interval);
+		clearTimeout(this.#interval);
 	}
 
-	#loop() {
-		const now = process.hrtime.bigint();
-		const delta = now - this.#loopStart;
-		const shouldRun =
-			delta >=
-			BigInt(
-				Math.round(
-					(this.#basePrecisionMsec * NSEC_IN_MSEC) / this.#callsPerMsec,
-				),
-			);
-		if (shouldRun) {
-			this.#loopStart = now;
-			this.call();
+	#prepareBatch(batchLength: number) {
+		const jobList = new Array<Task>(batchLength).fill(this.call.bind(this));
+		let taskBatch: Array<TaskGroup> = [];
+		while (jobList.length > 0) {
+			taskBatch.push(jobList.splice(0, APP_BATCH_SIZE));
 		}
-		this.#interval = setImmediate(this.#loop.bind(this));
+		IS_DEBUG &&
+			console.log('task batch split into', taskBatch.length, 'chunks');
+
+		const runner = () =>
+			taskBatch.reduce(
+				(acc, step, i) => {
+					return acc.finally(() =>
+						(() => {
+							IS_DEBUG && console.log(i, 'step', step.length);
+							return step.forEach((s) => s());
+						})(),
+					);
+				},
+				new Promise<void>((resolve) => {
+					resolve(undefined);
+				}),
+			);
+		return runner;
+	}
+
+	async #loop() {
+		const jobCount = (this.rps * this.#basePrecisionMsec) / MSEC_IN_SEC;
+		const batch = this.#prepareBatch(jobCount);
+		batch();
+		this.#interval = setTimeout(this.#loop.bind(this), this.#basePrecisionMsec);
 	}
 
 	async call() {
@@ -77,6 +94,8 @@ class PrecisionTimer {
 		return new Promise<void>((res, rej) => {
 			const timeout = Math.random() * 5000;
 			setTimeout(() => {
+				IS_DEBUG &&
+					console.log(`Async task with timeout of ${timeout} completed`);
 				res();
 			}, timeout);
 		});
@@ -84,9 +103,7 @@ class PrecisionTimer {
 }
 
 const test = async () => {
-	const rates = [
-		10, 100, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000,
-	];
+	const rates = [30000, 60000, 100000];
 	for await (const rate of rates) {
 		const total = await new Promise<number>((resolve) => {
 			let t = new PrecisionTimer(rate);
